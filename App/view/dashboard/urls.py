@@ -1,0 +1,21 @@
+#!/usr/bin/env python
+# -*- coding: UTF-8 -*-
+"""
+@Project ：wallpaper
+@File    ：urls.py
+@Author  ：LiangHB
+@Date    ：2026/4/20 14:39
+@description : 面板统计相关路由
+"""
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
+from App.view.dashboard.view import DashboardStatsViewSet, CustomerUserViewSet
+
+router = DefaultRouter()
+router.register(r"stats", DashboardStatsViewSet, basename="dashboard_stats")
+router.register(r"customer_user", CustomerUserViewSet, basename="customer_user_data")
+
+urlpatterns = [
+    path("", include(router.urls)),
+]

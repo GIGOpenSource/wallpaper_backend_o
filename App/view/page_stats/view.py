@@ -1,0 +1,326 @@
+#!/usr/bin/env python
+# -*- coding: UTF-8 -*-
+"""
+页面统计接口
+"""
+from rest_framework.decorators import action
+from drf_spectacular.utils import extend_schema, OpenApiParameter, extend_schema_view
+from tool.base_views import BaseViewSet
+from models.models import PageStats, TrackEvent
+from tool.utils import ApiResponse, CustomPagination
+from tool.permissions import IsAdmin
+from .serializer import PageStatsSerializer
+from seo.seo_tools import PageSEOAnalyzer
+from django.db.models import Count, Avg, Q, OuterRef, Subquery
+from django.utils import timezone
+import threading
+
+# 全局计数器（生产环境建议使用 Redis）
+_aggregate_counter = 0
+_seo_counter = 0
+_lock = threading.Lock()
+seo_analyzer = PageSEOAnalyzer()
+
+def _trigger_seo_update():
+    """触发 SEO 评分更新逻辑"""
+    global _seo_counter
+    with _lock:
+        _seo_counter += 1
+        print("_seo_count分数",str(_seo_counter))
+        if _seo_counter >= 6:
+            _seo_counter = 0
+            t = threading.Thread(target=_perform_seo_update)
+            t.daemon = True
+            t.start()
+
+# def _perform_seo_update():
+#     """执行 SEO 评分更新"""
+#     try:
+#         # 获取访问量最高的前 20 个页面进行 SEO 评分更新
+#         top_pages = PageStats.objects.order_by('-visit_count')[:20]
+#         for page in top_pages:
+#             score = seo_analyzer.calculate_seo_score(page.page_path)
+#             page.seo_score = score
+#             page.save(update_fields=['seo_score'])
+#     except Exception as e:
+#         print(f"SEO update error: {e}")
+
+def _perform_seo_update():
+    """执行 SEO 评分更新（批量获取 GSC 数据后匹配）"""
+    try:
+        from seo.seo_tools import GoogleSearchConsoleTool
+        from datetime import datetime, timedelta
+        import os
+
+        gsc_tool = GoogleSearchConsoleTool()
+
+        if not gsc_tool.service:
+            print("GSC 服务不可用，跳过 SEO 评分更新")
+            return
+
+        # 1. 获取访问量最高的前 30 个页面（你收录少，多拿点）
+        top_pages = list(PageStats.objects.order_by('-visit_count')[:80])
+        if not top_pages:
+            return
+
+        # 2. 构建 URL
+        base_url = os.getenv('GSC_SITE_URL', 'https://www.markwallpapers.com/')
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        site_url = base_url if base_url.endswith('/') else base_url + '/'
+
+        # 3. 获取GSC数据
+        rows = seo_analyzer.gsc_tool.get_search_analytics(
+            site_url, start_date, end_date, dimensions=['page']
+        )
+
+        # 4. URL => 数据映射
+        gsc_data_map = {row['keys'][0]: row for row in rows if row.get('keys')}
+
+        # 5. 计算SEO评分（适合你这种小流量、新收录站点）
+        for page in top_pages:
+            full_url = f"{base_url.rstrip('/')}{page.page_path}"
+            data = gsc_data_map.get(full_url)
+
+            score = 0  # 从0开始算，更真实
+
+            if data:
+                clicks = data['clicks']
+                impressions = data['impressions']
+                ctr = data['ctr']
+                position = data['position']
+
+                # 排名 40分
+                if position <= 5:
+                    score += 40
+                elif position <= 10:
+                    score += 30
+                elif position <= 20:
+                    score += 15
+                elif position <= 30:
+                    score += 5
+
+                # 点击率 25分
+                if ctr >= 0.10:
+                    score += 25
+                elif ctr >= 0.05:
+                    score += 15
+                elif ctr > 0:
+                    score += 5
+
+                # 点击量 20分（适配小站）
+                if clicks >= 10:
+                    score += 20
+                elif clicks >= 3:
+                    score += 15
+                elif clicks >= 1:
+                    score += 10
+
+                # 曝光量 15分
+                if impressions >= 100:
+                    score += 15
+                elif impressions >= 10:
+                    score += 10
+                elif impressions >= 1:
+                    score += 5
+            else:
+                # 无收录 = 极低分
+                score = 5
+
+            # 最终限制 0-100
+            page.seo_score = min(100, max(0, score))
+        # 6. 批量更新 🔥 只执行1次数据库
+        PageStats.objects.bulk_update(
+            top_pages,
+            fields=['seo_score'],
+            batch_size=50
+        )
+        print(f"✅ SEO 评分更新完成，处理 {len(top_pages)} 个页面")
+    except Exception as e:
+        print(f"❌ SEO update error: {e}")
+
+
+
+def _trigger_aggregate():
+    """触发聚合逻辑"""
+    global _aggregate_counter
+    with _lock:
+        _aggregate_counter += 1
+        if _aggregate_counter >= 1:
+            _aggregate_counter = 0
+            # 异步执行聚合，避免阻塞请求
+            t = threading.Thread(target=_perform_aggregation)
+            t.daemon = True
+            t.start()
+
+
+def _perform_aggregation():
+    try:
+        # ====================== 第一步：聚合统计（不变）
+        stats = TrackEvent.objects.filter(
+            event_type='page_stay'
+        ).values(
+            'page_path', 'page_type', 'device_type'
+        ).annotate(
+            visit_count=Count('id'),
+            avg_stay=Avg('page_stay'),
+            bounce_count=Count('id', filter=Q(is_bounce=True))
+        )
+
+        # ====================== 第二步：一次性把所有分组的最新 page_name 全部查出来（只查1次）
+        latest_page_name_subquery = TrackEvent.objects.filter(
+            page_path=OuterRef('page_path'),
+            page_type=OuterRef('page_type'),
+            device_type=OuterRef('device_type'),
+            event_type='page_stay',
+            page_name__isnull=False,
+        ).exclude(page_name='').order_by('-created_at').values('page_name')[:1]
+
+        # 给 stats 每条数据直接带上 page_name（无循环！）
+        stats = stats.annotate(
+            page_name=Subquery(latest_page_name_subquery)
+        )
+
+        # ====================== 第三步：准备批量插入/更新数据
+        page_stats_list = []
+
+        for item in stats:
+            if not item['page_path']:
+                continue
+
+            # 跳出率
+            visit_count = item['visit_count']
+            bounce_rate = (item['bounce_count'] / visit_count * 100) if visit_count > 0 else 0
+            # 构建要保存的对象
+            page_stats_list.append(PageStats(
+                page_path=item['page_path'],
+                page_type=item['page_type'] or 'unknown',
+                device_type=item['device_type'] or 'all',
+                page_name=item['page_name'],
+                visit_count=visit_count,
+                avg_stay_time=item['avg_stay'] or 0,
+                bounce_rate=round(bounce_rate, 2),
+                last_updated=timezone.now()
+            ))
+
+        # ====================== 第四步：批量更新或创建（1次操作完成580条）
+        PageStats.objects.bulk_create(
+            page_stats_list,
+            update_conflicts=True,
+            unique_fields=['page_path', 'page_type', 'device_type'],
+            update_fields=['page_name', 'visit_count', 'avg_stay_time', 'bounce_rate', 'last_updated']
+        )
+
+    except Exception as e:
+        print(f"Page stats aggregation error: {e}")
+
+@extend_schema(tags=["页面统计管理"])
+@extend_schema_view(
+    list=extend_schema(
+        summary="获取页面统计列表",
+        description="支持按页面类型、设备类型筛选，每查询10次自动触发一次数据聚合",
+        parameters=[
+            OpenApiParameter(name="page_type", type=str, required=False, description="页面类型（如 homepage, search, trending, tag）"),
+            OpenApiParameter(name="device_type", type=str, required=False, description="设备类型（pc, mobile, tablet, all）"),
+            OpenApiParameter(name="currentPage", type=int, required=False, description="当前页码"),
+            OpenApiParameter(name="pageSize", type=int, required=False, description="每页数量"),
+        ],
+    ),
+    retrieve=extend_schema(summary="获取页面统计详情"),
+    destroy=extend_schema(summary="删除统计数据"),
+)
+class PageStatsViewSet(BaseViewSet):
+    """
+    页面统计 ViewSet
+    仅支持查看和删除，不支持修改
+    list 数据已经是去重的，但seo得再算，以及平均停留看板数据是直接聚合的
+
+    """
+    queryset = PageStats.objects.all()
+    serializer_class = PageStatsSerializer
+    pagination_class = CustomPagination
+    permission_classes = [IsAdmin]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        page_type = self.request.query_params.get('page_type')
+        if page_type:
+            queryset = queryset.filter(page_type=page_type)
+        device_type = self.request.query_params.get('device_type')
+        if device_type:
+            queryset = queryset.filter(device_type=device_type)
+        return queryset.order_by('-visit_count')
+
+    def list(self, request, *args, **kwargs):
+        """获取页面统计列表"""
+        # 每次查询都尝试触发聚合
+        _trigger_aggregate()
+        # 每查询 10 次触发一次 SEO 评分更新
+        _trigger_seo_update()
+
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(queryset, many=True)
+        return ApiResponse(data=serializer.data, message="列表获取成功")
+
+    def retrieve(self, request, *args, **kwargs):
+        """获取统计详情"""
+        try:
+            instance = self.get_object()
+            serializer = self.get_serializer(instance)
+            return ApiResponse(data=serializer.data, message="详情获取成功")
+        except Exception as e:
+            return ApiResponse(code=500, message=f"详情获取失败: {str(e)}")
+
+    def destroy(self, request, *args, **kwargs):
+        """删除统计数据"""
+        try:
+            instance = self.get_object()
+            instance.delete()
+            return ApiResponse(message="删除成功")
+        except Exception as e:
+            return ApiResponse(code=500, message=f"删除失败: {str(e)}")
+
+    @extend_schema(
+        summary="页面统计看板",
+        description="获取页面统计核心指标：分端访问量、总页面数、总访问量、平均SEO评分及跳出率",
+        responses={200: {"type": "object"}}
+    )
+    @action(detail=False, methods=['get'], url_path='dashboard', name='页面统计看板')
+    def dashboard(self, request):
+        """获取页面统计看板数据（8个核心指标）"""
+        from django.db.models import Sum, Avg, Count, Q
+        
+        # 1. 基础统计数据（来自 PageStats 聚合表）
+        total_pages = PageStats.objects.count()
+        total_visits = PageStats.objects.aggregate(total=Sum('visit_count'))['total'] or 0
+        avg_seo = PageStats.objects.aggregate(avg=Avg('seo_score'))['avg'] or 0
+        avg_bounce = PageStats.objects.aggregate(avg=Avg('bounce_rate'))['avg'] or 0
+
+        # 2. 分端访问量统计（为了精确区分 Android/iOS，直接从 TrackEvent 原始表聚合）
+        # 桌面端
+        desktop_visits = TrackEvent.objects.filter(device_type='pc').count()
+        # 平板端
+        tablet_visits = TrackEvent.objects.filter(device_type='tablet').count()
+        # 移动端细分：通过 UA 关键字识别
+        android_visits = TrackEvent.objects.filter(
+            device_type='mobile', user_agent__icontains='android'
+        ).count()
+        ios_visits = TrackEvent.objects.filter(
+            device_type='mobile', 
+        ).exclude(user_agent__icontains='android').count() # 简化处理：非安卓的移动设备视为 iOS
+
+        return ApiResponse(data={
+            'desktop_visits': desktop_visits,
+            'android_visits': android_visits,
+            'ios_visits': ios_visits,
+            'tablet_visits': tablet_visits,
+            'total_pages': total_pages,
+            'total_visits': total_visits,
+            'avg_seo_score': round(avg_seo, 2),
+            'avg_bounce_rate': round(avg_bounce, 2)
+        }, message="看板数据获取成功")

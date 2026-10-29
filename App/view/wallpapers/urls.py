@@ -1,0 +1,28 @@
+#!/usr/bin/env python
+# -*- coding: UTF-8 -*-
+"""
+@Project ：crushcheck
+@File    ：urls.py
+@Author  ：LHB
+@Date    ：2026/01/26 15:10
+@description :
+"""
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
+
+from App.view.wallpapers.view import WallpapersViewSet
+from App.view.wallpapers.tags import urls as tags_urls
+from App.view.wallpapers.comments import urls as comments_urls
+from App.view.wallpapers.followers import urls as followers_urls
+from App.view.reports import urls as reports_urls
+router = DefaultRouter()
+router.register(r'wallpaper', WallpapersViewSet, basename='wallpaper')
+
+urlpatterns = [
+    path('', include(router.urls)),
+    path('tags/', include(tags_urls)),
+    path('comments/', include(comments_urls)),
+    path('followers/', include(followers_urls)),
+    path('report/',include(reports_urls))
+]
